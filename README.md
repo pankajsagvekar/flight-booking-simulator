@@ -1,2 +1,24 @@
-# flight-booking-simulator
-✈️ A simple Flight Booking Simulator built using FastAPI and SQLite, developed as part of the Infosys Internship. It allows users to view available flights, search by origin, destination, and date, sort by price or duration, and simulate external airline data — representing a basic real-world flight booking backend system.
+# ✈️ Flight Booking Simulator — Infosys Internship Project
+
+This project is a simple **Flight Booking Simulator** built using **FastAPI** and **SQLite** as part of the Infosys Internship.  
+It simulates a basic airline system where users can search available flights, view details, sort options, and mimic external airline data feeds.
+
+## 🚀 Features
+
+- 🗂️ SQLite database for flights (origin, destination, departure, arrival, price, seats)
+- 🔍 Search flights by **origin, destination, and date**
+- 📊 Sort results by **price** or **duration**
+- 📅 Retrieve **all available flights**
+- 🌐 Simulated **external airline schedule API**
+- ✅ Input validation with **Pydantic**
+- 🧾 Ready to integrate with a frontend booking system
+
+## 🧱 Tech Stack
+
+| Component | Technology |
+|------------|-------------|
+| Backend Framework | FastAPI |
+| Database | SQLite |
+| Language | Python 3 |
+| Validation | Pydantic |
+| Server | Uvicorn |
