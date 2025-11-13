@@ -1,5 +1,7 @@
 fastapi
 uvicorn
-pydantic
 requests
-dotenv
+sqlalchemy
+pydantic
+python-dotenv
+aiohttp
