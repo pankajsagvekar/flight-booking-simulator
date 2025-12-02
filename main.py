@@ -241,13 +241,34 @@ def ensure_flight_cache(
 
 
 def aero_flights_by_airport(origin: str, date: str):
-    from_time = f"{date}T00:00"
-    to_time = f"{date}T23:59"
-    url = f"{BASE_URL}/flights/airports/icao/{origin}/{from_time}/{to_time}"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"AeroDataBox error {resp.status_code}")
-    return resp.json()
+    params = {"direction": "Departure", "withCodeshared": "true"}
+    
+    # First half of the day
+    from_time_1 = f"{date}T00:00"
+    to_time_1 = f"{date}T11:59"
+    url_1 = f"{BASE_URL}/flights/airports/icao/{origin}/{from_time_1}/{to_time_1}"
+    try:
+        resp_1 = requests.get(url_1, headers=HEADERS, params=params, timeout=20)
+        resp_1.raise_for_status()
+        data1 = resp_1.json()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"AeroDataBox request failed for {url_1}: {e}")
+
+    # Second half of the day
+    from_time_2 = f"{date}T12:00"
+    to_time_2 = f"{date}T23:59"
+    url_2 = f"{BASE_URL}/flights/airports/icao/{origin}/{from_time_2}/{to_time_2}"
+    try:
+        resp_2 = requests.get(url_2, headers=HEADERS, params=params, timeout=20)
+        resp_2.raise_for_status()
+        data2 = resp_2.json()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"AeroDataBox request failed for {url_2}: {e}")
+
+    departures1 = data1.get("departures", []) or []
+    departures2 = data2.get("departures", []) or []
+
+    return {"departures": departures1 + departures2}
 
 
 def serialize_booking(booking: Booking) -> BookingDetail:
