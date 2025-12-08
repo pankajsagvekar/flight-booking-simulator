@@ -94,7 +94,7 @@ class BookingDetail(BaseModel):
 
 
 class PaymentRequest(BaseModel):
-    payment_method: str = "SIMULATED"
+    payment_method: str = "card"
     force_outcome: Optional[str] = Field(
         default=None, description="Force payment result: SUCCESS or FAIL"
     )
@@ -126,3 +126,23 @@ class FareHistoryOut(BaseModel):
     flight_number: str
     date: str
     history: List[FarePoint]
+
+
+class UserBase(BaseModel):
+    username: str
+    email: str
+    full_name: Optional[str] = None
+
+
+class UserCreate(UserBase):
+    password: str
+    role: str = "user"
+
+
+class User(UserBase):
+    id: int
+    role: str
+
+    class Config:
+        orm_mode = True
+

@@ -15,11 +15,24 @@ from sqlalchemy.orm import relationship
 from database import Base
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    email = Column(String, unique=True, index=True)
+    password = Column(String)  # In a real application, this should be hashed!
+    full_name = Column(String)
+    role = Column(String, default="user")  # 'user' or 'admin'
+
+    bookings = relationship("Booking", back_populates="user")
+
+
 class Booking(Base):
     __tablename__ = "bookings"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_name = Column(String, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
     email = Column(String, index=True)
     contact_phone = Column(String, nullable=True)
     flight_number = Column(String, index=True)
@@ -41,6 +54,7 @@ class Booking(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    user = relationship("User", back_populates="bookings")
     flight = relationship("FlightCache", back_populates="bookings")
     seats = relationship(
         "SeatAssignment", back_populates="booking", cascade="all, delete-orphan"

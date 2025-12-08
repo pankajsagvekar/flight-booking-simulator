@@ -172,7 +172,7 @@ function App() {
       const { data } = await api.post(
         `/api/bookings/${holdResult.booking_id}/payment`,
         {
-          payment_method: "SIMULATED",
+          payment_method: "card",
           force_outcome: forcedOutcome || null,
         }
       );
@@ -230,7 +230,7 @@ function App() {
     <div className="app-shell">
       <header>
         <div>
-          <p className="eyebrow">Flight Booking Simulator</p>
+          <p className="eyebrow">Flight Booking</p>
           <h1>Dynamic pricing & booking workflow</h1>
         </div>
         {searchMeta && (
@@ -515,7 +515,7 @@ function App() {
                   onClick={() => handlePayment()}
                   disabled={paymentLoading}
                 >
-                  Auto simulate
+                  Pay now
                 </button>
                 <button type="button" onClick={handleCancelBooking}>
                   Cancel booking

@@ -3,18 +3,18 @@ import json
 import os
 import random
 import string
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import List
 
-import requests
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
+import auth
 from database import Base, SessionLocal, engine, ensure_schema_migrations
-from models import Booking, FareHistory, FlightCache, SeatAssignment, SeatInventory
+from models import Booking, FareHistory, FlightCache, SeatAssignment, SeatInventory, User
 from schemas import (
     BookingDetail,
     BookingHoldRequest,
@@ -30,21 +30,12 @@ from schemas import (
     PaymentResponse,
     PricingTier,
     SeatInfo,
+    User as UserSchema,
+    UserCreate,
 )
 
-load_dotenv()
-API_KEY = os.getenv("API_MARKET_KEY") or os.getenv("AERODATABOX_API_KEY")
-BASE_URL = os.getenv(
-    "AERODATABOX_BASE",
-    os.getenv("AERODATABOX_BASE", "https://prod.api.market/api/v1/aedbx/aerodatabox"),
-)
-SIM_LOOP = int(os.getenv("SIMULATOR_LOOP_SECONDS", "30"))
+MARKET_UPDATE_INTERVAL = int(os.getenv("MARKET_UPDATE_INTERVAL", "30"))
 DEFAULT_HOLD_MINUTES = int(os.getenv("BOOKING_HOLD_MINUTES", "15"))
-
-if not API_KEY:
-    raise RuntimeError("API_MARKET_KEY or AERODATABOX_API_KEY must be set in .env")
-
-HEADERS = {"accept": "application/json", "x-api-market-key": API_KEY}
 
 PRICING_MULTIPLIERS = {
     "ECONOMY": {"multiplier": 1.0},
@@ -60,7 +51,7 @@ CABIN_LAYOUT = {
 Base.metadata.create_all(bind=engine)
 ensure_schema_migrations()
 
-app = FastAPI(title="Flight Booking Simulator � Dynamic Pricing")
+app = FastAPI(title="Flight Booking - Dynamic Pricing")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -69,7 +60,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 def get_db():
     db = SessionLocal()
     try:
@@ -77,6 +67,79 @@ def get_db():
     finally:
         db.close()
 
+#
+# Authentication Endpoints
+#
+
+@app.post("/api/signup", response_model=UserSchema)
+def signup(user: UserCreate, response: Response, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.username == user.username).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    new_user = User(
+        username=user.username,
+        email=user.email,
+        password=user.password, # WARNING: Storing plaintext password
+        full_name=user.full_name,
+        role=user.role,
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    auth.login_user(response, new_user)
+    return new_user
+
+@app.post("/api/login")
+def login(user_credentials: UserCreate, response: Response, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == user_credentials.username).first()
+    if not user or user.password != user_credentials.password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+        )
+    auth.login_user(response, user)
+    return {"message": "Login successful"}
+
+@app.post("/api/logout")
+def logout(response: Response):
+    auth.logout_user(response)
+    return {"message": "Logout successful"}
+
+
+@app.get("/api/users/me", response_model=UserSchema)
+def read_users_me(current_user: User = Depends(auth.get_current_user)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return current_user
+
+
+@app.put("/api/users/me", response_model=UserSchema)
+def update_user_me(
+    user_update: UserSchema,
+    current_user: User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_data = user_update.dict(exclude_unset=True)
+    for key, value in user_data.items():
+        setattr(user, key, value)
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+#
+# Flight and Booking Endpoints
+#
 
 def clamp(value: float, min_val: float, max_val: float) -> float:
     return max(min_val, min(value, max_val))
@@ -134,7 +197,7 @@ def ensure_seat_inventory(db: Session, flight: FlightCache):
 
     layout = generate_seat_layout()
     random.seed(hash(flight.flight_number))
-    simulated_blocks = set(random.sample(range(len(layout)), k=int(len(layout) * 0.08)))
+    pre_reserved_seats = set(random.sample(range(len(layout)), k=int(len(layout) * 0.08)))
 
     for idx, seat in enumerate(layout):
         db.add(
@@ -142,13 +205,13 @@ def ensure_seat_inventory(db: Session, flight: FlightCache):
                 flight_id=flight.id,
                 seat_number=seat["seat_number"],
                 cabin_class=seat["cabin_class"],
-                is_reserved=idx in simulated_blocks,
-                reservation_source="SIMULATOR" if idx in simulated_blocks else "AVAILABLE",
+                is_reserved=idx in pre_reserved_seats,
+                reservation_source="BLOCKED" if idx in pre_reserved_seats else "AVAILABLE",
             )
         )
 
     flight.seats_total = len(layout)
-    flight.seats_left = len(layout) - len(simulated_blocks)
+    flight.seats_left = len(layout) - len(pre_reserved_seats)
     db.commit()
 
 
@@ -240,35 +303,43 @@ def ensure_flight_cache(
     return flight
 
 
-def aero_flights_by_airport(origin: str, date: str):
-    params = {"direction": "Departure", "withCodeshared": "true"}
-    
-    # First half of the day
-    from_time_1 = f"{date}T00:00"
-    to_time_1 = f"{date}T11:59"
-    url_1 = f"{BASE_URL}/flights/airports/icao/{origin}/{from_time_1}/{to_time_1}"
-    try:
-        resp_1 = requests.get(url_1, headers=HEADERS, params=params, timeout=20)
-        resp_1.raise_for_status()
-        data1 = resp_1.json()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"AeroDataBox request failed for {url_1}: {e}")
+def generate_flight_schedule(origin: str, destination: str, date: str) -> List[dict]:
+    results = []
+    seed = abs(hash(f"{origin}-{destination}-{date}"))
+    random.seed(seed)
 
-    # Second half of the day
-    from_time_2 = f"{date}T12:00"
-    to_time_2 = f"{date}T23:59"
-    url_2 = f"{BASE_URL}/flights/airports/icao/{origin}/{from_time_2}/{to_time_2}"
-    try:
-        resp_2 = requests.get(url_2, headers=HEADERS, params=params, timeout=20)
-        resp_2.raise_for_status()
-        data2 = resp_2.json()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"AeroDataBox request failed for {url_2}: {e}")
+    airline_codes = {
+        "Indigo": "6E",
+        "Vistara": "UK",
+        "Air India": "AI",
+        "Spicejet": "SG",
+        "Akasa Air": "QP",
+    }
 
-    departures1 = data1.get("departures", []) or []
-    departures2 = data2.get("departures", []) or []
+    for _ in range(random.randint(4, 10)):
+        airline = random.choice(list(airline_codes.keys()))
+        flight_number = f"{airline_codes[airline]}{random.randint(100, 999)}"
+        
+        departure_hour = random.randint(0, 23)
+        departure_minute = random.randint(0, 59)
+        departure_time = f"{departure_hour:02d}:{departure_minute:02d}"
 
-    return {"departures": departures1 + departures2}
+        arrival_hour = (departure_hour + random.randint(1, 4)) % 24
+        arrival_minute = random.randint(0, 59)
+        arrival_time = f"{arrival_hour:02d}:{arrival_minute:02d}"
+
+        results.append(
+            {
+                "number": flight_number,
+                "airline": {"name": airline},
+                "departure": {"scheduledTimeLocal": f"{date}T{departure_time}"},
+                "arrival": {
+                    "scheduledTimeLocal": f"{date}T{arrival_time}",
+                    "airport": {"icao": destination},
+                },
+            }
+        )
+    return results
 
 
 def serialize_booking(booking: Booking) -> BookingDetail:
@@ -339,18 +410,59 @@ def release_booking_seats(session: Session, booking: Booking):
     return released
 
 
-def simulator_random_shift(val: float) -> float:
+def apply_demand_random_shift(val: float) -> float:
     return clamp(val + random.uniform(-0.04, 0.08), 0.0, 1.0)
 
 
-async def simulator_loop():
+def seed_database_if_empty():
+    db = SessionLocal()
+    if db.query(FlightCache).count() > 0:
+        print("Database already seeded with flights.")
+    else:
+        print("Database is empty, seeding with initial flight data...")
+        routes = [
+            ("VIDP", "VABB"),
+            ("VABB", "VIDP"),
+            ("VOMM", "VIDP"),
+            ("VIDP", "VOMM"),
+            ("VECC", "VABB"),
+            ("VABB", "VECC"),
+            ("VOBG", "VECC"),
+            ("VECC", "VOBG"),
+        ]
+
+        airline_codes = {
+            "Indigo": "6E",
+            "Vistara": "UK",
+            "Air India": "AI",
+            "Spicejet": "SG",
+            "Akasa Air": "QP",
+        }
+
+        today = date.today()
+        for i in range(7):
+            current_date = today + timedelta(days=i)
+            date_str = current_date.strftime("%Y-%m-%d")
+
+            for origin, destination in routes:
+                for _ in range(random.randint(2, 5)):
+                    airline = random.choice(list(airline_codes.keys()))
+                    flight_number = f"{airline_codes[airline]}{random.randint(1000, 9999)}"
+                    ensure_flight_cache(db, flight_number, date_str, origin, destination, airline)
+        print("Database flight seeding complete.")
+    
+    auth.create_initial_users()
+    db.close()
+
+
+async def market_price_updater_loop():
     while True:
         try:
             db = SessionLocal()
             flights = db.query(FlightCache).all()
             for flight in flights:
                 ensure_seat_inventory(db, flight)
-                flight.demand_score = simulator_random_shift(flight.demand_score)
+                flight.demand_score = apply_demand_random_shift(flight.demand_score)
 
                 available_seats = (
                     db.query(SeatInventory)
@@ -360,19 +472,19 @@ async def simulator_loop():
                 if available_seats and random.random() < 0.25:
                     seat = random.choice(available_seats)
                     seat.is_reserved = True
-                    seat.reservation_source = "SIMULATOR"
+                    seat.reservation_source = "BLOCKED"
 
-                simulator_held = (
+                system_held_seats = (
                     db.query(SeatInventory)
                     .filter(
                         SeatInventory.flight_id == flight.id,
-                        SeatInventory.reservation_source == "SIMULATOR",
+                        SeatInventory.reservation_source == "BLOCKED",
                         SeatInventory.is_reserved.is_(True),
                     )
                     .all()
                 )
-                if simulator_held and random.random() < 0.15:
-                    seat = random.choice(simulator_held)
+                if system_held_seats and random.random() < 0.15:
+                    seat = random.choice(system_held_seats)
                     seat.is_reserved = False
                     seat.reservation_source = "AVAILABLE"
 
@@ -388,13 +500,14 @@ async def simulator_loop():
             db.commit()
             db.close()
         except Exception as exc:
-            print("Simulator error", exc)
-        await asyncio.sleep(SIM_LOOP)
+            print("Market updater error", exc)
+        await asyncio.sleep(MARKET_UPDATE_INTERVAL)
 
 
 @app.on_event("startup")
 async def start_background_tasks():
-    asyncio.create_task(simulator_loop())
+    seed_database_if_empty()
+    asyncio.create_task(market_price_updater_loop())
 
 
 @app.get("/api/flights/search", response_model=FlightSearchResponse)
@@ -404,14 +517,14 @@ def search_flights(
     date: str = Query(..., description="YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ):
-    api = aero_flights_by_airport(origin, date)
-    departures = api.get("departures", [])
+    departures = generate_flight_schedule(origin, destination, date)
     results: List[FlightOut] = []
+
     for flight in departures:
         dest = flight.get("arrival", {}).get("airport", {}).get("icao", "")
         if not dest or dest.upper() != destination.upper():
             continue
-        flight_num = flight.get("number") or flight.get("callsign") or "N/A"
+        flight_num = flight.get("number") or "N/A"
         dep_time = flight.get("departure", {}).get("scheduledTimeLocal")
         arr_time = flight.get("arrival", {}).get("scheduledTimeLocal")
 
@@ -485,10 +598,24 @@ def seat_map(flight_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/bookings/hold", response_model=BookingHoldResponse, status_code=status.HTTP_201_CREATED)
-def hold_booking(payload: BookingHoldRequest, db: Session = Depends(get_db)):
+def hold_booking(
+    payload: BookingHoldRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(auth.get_current_user),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
     flight = db.query(FlightCache).get(payload.flight_id)
     if not flight:
         raise HTTPException(status_code=404, detail="Flight not found")
+
+    try:
+        flight_datetime = datetime.strptime(flight.date, "%Y-%m-%d")
+        if flight_datetime < datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0):
+            raise HTTPException(status_code=400, detail="Cannot book a flight that has already departed.")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid flight date format")
 
     ensure_seat_inventory(db, flight)
 
@@ -517,8 +644,8 @@ def hold_booking(payload: BookingHoldRequest, db: Session = Depends(get_db)):
     hold_expires_at = datetime.utcnow() + timedelta(minutes=hold_minutes)
 
     booking = Booking(
-        user_name=payload.contact_name,
-        email=payload.contact_email,
+        user_id=current_user.id,
+        email=current_user.email,
         contact_phone=payload.contact_phone,
         flight_number=flight.flight_number,
         flight_cache_id=flight.id,
@@ -601,7 +728,7 @@ def process_payment(booking_id: int, payload: PaymentRequest, db: Session = Depe
         raise HTTPException(status_code=400, detail="force_outcome must be SUCCESS or FAIL")
 
     success = force == "SUCCESS" or (force == "" and random.random() > 0.25)
-    reference = f"SIM-{int(datetime.utcnow().timestamp())}-{random.randint(1000,9999)}"
+    reference = f"TXN-{int(datetime.utcnow().timestamp())}-{random.randint(1000,9999)}"
 
     booking.payment_attempts = (booking.payment_attempts or 0) + 1
 
@@ -627,14 +754,20 @@ def process_payment(booking_id: int, payload: PaymentRequest, db: Session = Depe
     if booking.flight:
         booking.flight.seats_left = max(0, booking.flight.seats_left + released)
     db.commit()
-    raise HTTPException(status_code=402, detail="Payment failed � seats released")
+    raise HTTPException(status_code=402, detail="Payment failed - seats released")
 
 
 @app.post("/api/bookings/{booking_id}/cancel", response_model=CancellationResponse)
-def cancel_booking(booking_id: int, db: Session = Depends(get_db)):
+def cancel_booking(booking_id: int, db: Session = Depends(get_db), current_user: User = Depends(auth.get_current_user)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
     booking = db.query(Booking).get(booking_id)
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
+
+    if current_user.role != "admin" and booking.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to cancel this booking")
 
     if booking.status in {"CANCELLED", "EXPIRED"}:
         return CancellationResponse(status=booking.status, message="Booking already closed")
@@ -651,20 +784,31 @@ def cancel_booking(booking_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/bookings", response_model=BookingHistoryResponse)
 @app.get("/api/bookings/history", response_model=BookingHistoryResponse)
-def list_bookings(email: str | None = Query(default=None), db: Session = Depends(get_db)):
+def list_bookings(db: Session = Depends(get_db), current_user: User = Depends(auth.get_current_user)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+        
     query = db.query(Booking)
-    if email:
-        query = query.filter(Booking.email == email)
-    bookings = query.order_by(Booking.created_at.desc()).all()
+    if current_user.role != "admin":
+        query = query.filter(Booking.user_id == current_user.id)
+    
+    bookings = query.order_by(Booking.created_.desc()).all()
     payload = [serialize_booking(booking) for booking in bookings]
     return BookingHistoryResponse(count=len(payload), bookings=payload)
 
 
 @app.get("/api/bookings/{booking_id}", response_model=BookingDetail)
-def booking_detail(booking_id: int, db: Session = Depends(get_db)):
+def booking_detail(booking_id: int, db: Session = Depends(get_db), current_user: User = Depends(auth.get_current_user)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
     booking = db.query(Booking).get(booking_id)
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
+
+    if current_user.role != "admin" and booking.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to view this booking")
+
     return serialize_booking(booking)
 
 

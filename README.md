@@ -1,7 +1,7 @@
-# ✈️ Flight Booking Simulator — Infosys Internship Project
+# ✈️ Flight Booking — Infosys Internship Project
 
-This project is a simple **Flight Booking Simulator** built using **FastAPI** and **SQLite** as part of the Infosys Internship.  
-It simulates a basic airline system where users can search available flights, view details, sort options, and mimic external airline data feeds.
+This project is a **Flight Booking** application built using **FastAPI** and **SQLite** as part of the Infosys Internship.
+It provides a basic airline system where users can search available flights, view details, and sort options.
 
 ## 🚀 Features
 

@@ -11,7 +11,7 @@ api.interceptors.response.use(
     const message =
       error?.response?.data?.detail ||
       error?.message ||
-      "Unable to reach the simulator API";
+      "Unable to reach the API";
     return Promise.reject(new Error(message));
   }
 );
